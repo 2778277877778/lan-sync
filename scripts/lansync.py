@@ -32,7 +32,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 SERVICE = "marvis-lan-sync"
 DEFAULT_PORT = 32100
 DEFAULT_DISCOVERY_PORT = 32101
@@ -1384,9 +1384,63 @@ def gui():
         threading.Thread(target=work, daemon=True).start()
 
     def open_web():
-        st, running = is_service_running()
-        port = st.get("port") or cfg.get("port", DEFAULT_PORT)
-        webbrowser.open(f"http://127.0.0.1:{port}/?key={cfg['key']}")
+        # 先确保服务在跑：服务被系统/杀软结束或用户误关后，直接开浏览器只会看到连不上
+        tip.set("正在检查服务…")
+
+        def work():
+            st, running = is_service_running()
+            if not running:
+                try:
+                    start_background()
+                except Exception:
+                    pass
+                st, running = is_service_running()
+            port = st.get("port") or cfg.get("port", DEFAULT_PORT)
+            url = f"http://127.0.0.1:{port}/?key={urllib.parse.quote(cfg['key'])}"
+            ui(finish_open_web, url, running)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_open_web(url, running):
+        refresh_status()
+        if not running:
+            root.clipboard_clear()
+            root.clipboard_append(url)
+            tip.set("服务启动失败，网页地址已复制到剪贴板，可手动打开")
+            return
+        opened = False
+        try:
+            opened = webbrowser.open(url)
+        except Exception:
+            opened = False
+        if not opened:
+            try:
+                os.startfile(url)
+                opened = True
+            except Exception:
+                opened = False
+        if not opened:
+            try:
+                subprocess.Popen(["cmd", "/c", "start", "", url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 creationflags=0x00000008)  # DETACHED_PROCESS
+                opened = True
+            except Exception:
+                opened = False
+        if opened:
+            tip.set("已打开网页：" + url)
+        else:
+            root.clipboard_clear()
+            root.clipboard_append(url)
+            tip.set("无法自动打开浏览器，地址已复制到剪贴板")
+
+    def tick_status():
+        # 定时刷新状态，避免服务已退出但界面仍显示“运行中”
+        def work():
+            st, running = is_service_running()
+            ui(apply_status, st, running)
+        threading.Thread(target=work, daemon=True).start()
+        root.after(4000, tick_status)
 
     # ---------- 启动 ----------
     def boot():
@@ -1405,6 +1459,10 @@ def gui():
     root.after(120, poll_queue)
     root.after(200, boot)
     root.after(2600, tick_inbox)
+    root.after(4000, tick_status)
+    if os.environ.get("LAN_SYNC_GUI_OPENWEB_TEST") == "1":
+        # 隐藏测试钩子：启动后自动点一次“打开网页”，供自动化验证窗口版 exe
+        root.after(1500, open_web)
     if selftest:
         root.after(1500, root.destroy)
 
