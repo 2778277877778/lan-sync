@@ -32,7 +32,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 SERVICE = "marvis-lan-sync"
 DEFAULT_PORT = 32100
 DEFAULT_DISCOVERY_PORT = 32101
@@ -58,6 +58,7 @@ def paths():
         "inbox_files": h / "inbox" / "files",
         "inbox_msgs": h / "inbox" / "messages.jsonl",
         "state": h / "state.json",
+        "peers": h / "peers.json",
         "log": h / "server.log",
     }
 
@@ -164,11 +165,132 @@ def broadcast_targets(ip_list):
     return targets
 
 
-def discover(timeout: float = 2.0):
-    """UDP 广播寻找局域网内已启动接收服务的设备。"""
+def http_ping(ip: str, port: int, timeout: float = 1.5):
+    """探测某地址是否是 lan-sync 服务；是则返回其 /api/ping 内容。"""
+    try:
+        conn = http.client.HTTPConnection(ip, int(port), timeout=timeout)
+        conn.request("GET", "/api/ping")
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "ignore")
+        conn.close()
+        obj = json.loads(raw or "{}")
+        if obj.get("service") == SERVICE:
+            return obj
+    except Exception:
+        pass
+    return None
+
+
+def load_peers() -> list:
+    p = paths()["peers"]
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8-sig"))
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, dict) and x.get("ip")]
+        except Exception:
+            pass
+    return []
+
+
+def save_peers(peers: list) -> None:
+    try:
+        seen = {}
+        for x in peers:
+            if x.get("ip"):
+                seen[x["ip"]] = x
+        items = sorted(seen.values(), key=lambda x: x.get("last", ""), reverse=True)[:50]
+        paths()["peers"].write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def remember_peer(ip: str, port: int = DEFAULT_PORT, device: str = "", via: str = "send") -> None:
+    """记住连过的设备：广播被屏蔽或跨子网时，靠这份历史直接单播。"""
+    if not ip or ip.startswith("127.") or ip in local_ips():
+        return
+    peers = load_peers()
+    for x in peers:
+        if x.get("ip") == ip:
+            x.update(port=int(port), device=device or x.get("device", ""), last=now_str(), via=via)
+            break
+    else:
+        peers.append({"ip": ip, "port": int(port), "device": device, "last": now_str(), "via": via})
+    save_peers(peers)
+
+
+def probe_peers(port: int = None, timeout: float = 0.8, limit: int = 24):
+    """单播探测历史设备。跨子网时只有这条路径有效。"""
+    peers = load_peers()[:limit]
+    found = []
+    if not peers:
+        return found
+    lock = threading.Lock()
+
+    def work(p):
+        ip = p["ip"]
+        prt = int(p.get("port") or port or DEFAULT_PORT)
+        info = http_ping(ip, prt, timeout)
+        if info:
+            with lock:
+                found.append({"ip": ip, "port": prt,
+                              "device": info.get("device") or p.get("device", ""),
+                              "via": "known"})
+
+    threads = [threading.Thread(target=work, args=(p,), daemon=True) for p in peers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 1.0)
+    return found
+
+
+def scan_local_ports(port: int = None, timeout: float = 0.35, workers: int = 48):
+    """扫本机所在 /24 的端口。广播被 AP 屏蔽时，这条能兜住同网段的设备。"""
+    from concurrent.futures import ThreadPoolExecutor
+    port = int(port or load_config().get("port", DEFAULT_PORT))
+    mine = local_ips()
+    base = None
+    for ip in mine:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            base = ".".join(parts[:3])
+            break
+    if not base:
+        return []
+    out = []
+    lock = threading.Lock()
+
+    def work(n):
+        ip = f"{base}.{n}"
+        if ip in mine:
+            return
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            if s.connect_ex((ip, port)) != 0:
+                return
+        except Exception:
+            return
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+        info = http_ping(ip, port, 1.5)
+        if info:
+            with lock:
+                out.append({"ip": ip, "port": port,
+                            "device": info.get("device", ""), "via": "scan"})
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(work, range(1, 255)))
+    return out
+
+
+def _discover_broadcast(timeout: float):
     cfg = load_config()
     dport = int(cfg.get("discovery_port", DEFAULT_DISCOVERY_PORT))
-    my_name = cfg.get("device_name", socket.gethostname())
     found = {}
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -199,15 +321,63 @@ def discover(timeout: float = 2.0):
         ip = obj.get("ip") or addr[0]
         if ip.startswith("127."):
             ip = addr[0]
-        if obj.get("device") == my_name and ip in local_ips():
+        if ip in local_ips():
             continue  # 自己
-        found[ip] = {
-            "ip": ip,
-            "device": obj.get("device", "unknown"),
-            "port": obj.get("port", DEFAULT_PORT),
-        }
+        found[ip] = {"ip": ip, "port": obj.get("port", DEFAULT_PORT),
+                     "device": obj.get("device", "unknown"), "via": "broadcast"}
     sock.close()
     return list(found.values())
+
+
+def discover(timeout: float = 2.0, deep: bool = True, port: int = None):
+    """三路发现：UDP 广播 → 历史设备单播 → 本网段端口扫描。
+
+    广播只在同网段且未被 AP 屏蔽时有效；单播能跨子网；扫描兜住"广播被屏蔽
+    但同网段"的情况。结果里 via 标明来源，方便判断该信哪条。
+    """
+    found = {}
+    my_ips = local_ips()
+
+    def add(item):
+        ip = item.get("ip")
+        if not ip or ip.startswith("127.") or ip in my_ips:
+            return
+        if ip not in found:
+            found[ip] = item
+
+    for item in _discover_broadcast(timeout):
+        add(item)
+    for item in probe_peers(port=port):
+        add(item)
+    if deep and not found:
+        for item in scan_local_ports(port=port):
+            add(item)
+    return list(found.values())
+
+
+def check_key(ip: str, port: int, key: str) -> dict:
+    """判断目标是否在线、密钥是否匹配。用专用 /api/auth，不读取对方数据。"""
+    info = http_ping(ip, port, 2.0)
+    if not info:
+        return {"reachable": False, "auth": None}
+    res = {"reachable": True, "device": info.get("device", ""),
+           "version": info.get("version", ""), "auth": None}
+    for path in ("/api/auth", "/api/inbox"):
+        try:
+            conn = http.client.HTTPConnection(ip, int(port), timeout=3)
+            conn.request("GET", f"{path}?key=" + urllib.parse.quote(key))
+            r = conn.getresponse()
+            r.read()
+            status = r.status
+            conn.close()
+            if status == 404:
+                continue  # 老版本没有 /api/auth，退化成 /api/inbox 看状态码
+            res["auth"] = (status == 200)
+            break
+        except Exception:
+            res["auth"] = False
+            break
+    return res
 
 
 def resolve_target(target: str):
@@ -370,6 +540,12 @@ class Handler(BaseHTTPRequestHandler):
             if token != self.server.sync_key:
                 return self._html(401, "<h3>需要密钥</h3><p>请访问 http://IP:端口/?key=配对密钥</p>")
             return self._html(200, WEB_UI.replace("__KEY__", token))
+
+        if route == "/api/auth":
+            # 只回答"密钥对不对"，不返回任何收件数据，供 check / 发现时判断。
+            if not self._authed(query):
+                return self._json(401, {"ok": False, "error": "密钥不匹配"})
+            return self._json(200, {"ok": True, "device": cfg.get("device_name")})
 
         if route == "/api/inbox":
             if not self._authed(query):
@@ -846,11 +1022,19 @@ def cmd_send(args):
     except Exception as e:
         die(f"连不上 {ip}:{port} —— {e}\n请确认对端已启动服务（serve），且防火墙已放行该端口。")
 
+    def key_mismatch():
+        die(f"密钥不匹配（401）。\n"
+            f"  本机密钥: {cfg['key']}   目标: {ip}:{port}\n"
+            f"  对齐方式（任选其一，两边一致即可）：\n"
+            f"    1) 本机执行  pair --key <对方的密钥>\n"
+            f"    2) 对方执行  pair --key {cfg['key']}\n"
+            f"  修改后服务会自动重启，无需手动 stop。")
+
     results = []
     if args.text:
         res = post_text(ip, port, cfg["key"], args.text, sender)
         if res["status"] == 401:
-            die("密钥不匹配（401）。请在两台机器上执行 `pair --key <同一个密钥>` 对齐后重试。")
+            key_mismatch()
         results.append(("文本", res["status"]))
 
     for f in args.file or []:
@@ -863,12 +1047,15 @@ def cmd_send(args):
         for one in files:
             res = put_file(ip, port, cfg["key"], one, sender)
             if res["status"] == 401:
-                die("密钥不匹配（401）。请在两台机器上执行 `pair --key <同一个密钥>` 对齐后重试。")
+                key_mismatch()
             ok = res["status"] == 200
             print(f"  {'OK' if ok else 'FAIL'} {one.name}  {res['bytes'] // 1024} KB  {res['seconds']}s")
             results.append((one.name, res["status"]))
 
     bad = [r for r in results if r[1] != 200]
+    if results and not bad:
+        # 记住了才能在下一次网络环境变化后靠单播找回，不必依赖广播
+        remember_peer(ip, port, info.get("device", ""), via="send")
     print(f"\n发送到 {info.get('device', '?')} ({ip}:{port})：成功 {len(results) - len(bad)}，失败 {len(bad)}")
     if bad:
         for name, code in bad:
@@ -907,15 +1094,50 @@ def cmd_status(args):
 
 
 def cmd_discover(args):
-    peers = discover(timeout=args.timeout)
+    deep = not getattr(args, "no_scan", False)
+    if deep:
+        print("正在发现（广播 + 已知设备" + (" + 扫描本网段" if deep else "") + "）…")
+    peers = discover(timeout=args.timeout, deep=deep)
     if not peers:
-        print("未发现局域网内其他在线设备。")
-        print("提示：对端需先运行 serve；若已运行仍发现不到，路由器可能屏蔽了广播，")
-        print("     可直接用对方 info 里的 IP 加 --target 手动指定。")
+        print("未发现其他在线设备。")
+        print("可能原因与对策：")
+        print("  1. 对端没启动服务 → 让对方执行 serve --background")
+        print("  2. 跨子网或路由器屏蔽了 UDP 广播 → 直接填对端 IP：")
+        print("        send --target <对方IP> --text \"测试\"")
+        print("     用对方 info 里的 IP；连过一次后会自动记住，下次点发现就能找回")
+        print("  3. 同一台机器上测试请用 127.0.0.1，不会出现在发现列表里")
         return
+    labels = {"broadcast": "广播", "known": "已知设备", "scan": "扫描"}
     print(f"发现 {len(peers)} 台设备：")
     for p in peers:
-        print(f"  {p['ip']:<16} {p['device']}  (端口 {p['port']})")
+        note = labels.get(p.get("via", ""), p.get("via", ""))
+        print(f"  {p['ip']:<16} {p['device'] or '?'}  (端口 {p['port']}, 来自{note})")
+    for p in peers:
+        remember_peer(p["ip"], p["port"], p.get("device", ""), via=p.get("via", "discover"))
+
+
+def cmd_check(args):
+    """检查目标在线状态与密钥是否匹配。"""
+    ip, port = resolve_target(args.target)
+    cfg = load_config()
+    print(f"目标: {ip}:{port}")
+    print(f"本机密钥: {cfg['key']}")
+    res = check_key(ip, port, cfg["key"])
+    if not res["reachable"]:
+        print("  连通性: ✗ 连不上")
+        print("  可能原因: 对端服务未启动 / 端口被防火墙拦 / IP 不对")
+        sys.exit(1)
+    print(f"  连通性: ✓ 在线  (设备 {res['device'] or '?'}, 版本 {res['version'] or '?'})")
+    if res["auth"] is True:
+        print("  密钥: ✓ 匹配，可以直接发送")
+        remember_peer(ip, port, res["device"], via="check")
+    elif res["auth"] is False:
+        print("  密钥: ✗ 不匹配（对端会用 401 拒收）")
+        print(f"  处理: 让对方执行  pair --key {cfg['key']}")
+        print(f"        或本机执行  pair --key <对方的密钥>")
+        sys.exit(2)
+    else:
+        print("  密钥: ? 无法判定（对端版本可能过旧）")
 
 
 def cmd_pair(args):
@@ -933,6 +1155,23 @@ def cmd_pair(args):
         res = start_background()
         print(f"  服务已自动重启以应用新密钥（端口 {res.get('port', cfg['port'])}）")
     print("请在另一台机器上执行同样的命令，两边保持一致。")
+
+
+def cmd_key(args):
+    cfg = load_config()
+    if args.new:
+        cfg["key"] = secrets.token_hex(4)
+        save_config(cfg)
+        print(f"[lan-sync] 新密钥: {cfg['key']}")
+        st = read_state()
+        if st.get("pid") and is_running(st["pid"]):
+            stop_service(quiet=True)
+            time.sleep(0.5)
+            start_background()
+            print("  服务已自动重启，新密钥已生效")
+        print(f"  请让对端执行: pair --key {cfg['key']}")
+        return
+    print(cfg["key"])
 
 
 def cmd_inbox(args):
@@ -1176,10 +1415,11 @@ def gui():
     trow = ttk.Frame(send_tab)
     trow.pack(fill="x")
     ttk.Label(trow, text="目标设备").pack(side="left")
-    target_box = ttk.Combobox(trow, width=34)
+    target_box = ttk.Combobox(trow, width=28)
     target_box.pack(side="left", padx=(8, 6))
     ttk.Button(trow, text="发现设备", command=lambda: do_discover()).pack(side="left")
-    ttk.Button(trow, text="用本机", width=8, command=lambda: use_self()).pack(side="left", padx=(6, 0))
+    ttk.Button(trow, text="检查密钥", width=9, command=lambda: check_current()).pack(side="left", padx=(6, 0))
+    ttk.Button(trow, text="用本机", width=7, command=lambda: use_self()).pack(side="left", padx=(6, 0))
 
     ttk.Label(send_tab, text="文本").pack(anchor="w", pady=(14, 4))
     text_box = tk.Text(send_tab, height=7, wrap="word", undo=True)
@@ -1261,7 +1501,9 @@ def gui():
             try:
                 res = post_text(ip, port, cfg["key"], content, sender_name())
                 if res["status"] == 401:
-                    raise RuntimeError("密钥不匹配（401），请先在两台机器上用同一密钥配对")
+                    raise RuntimeError(f"密钥不匹配（401），对方拒收。\n\n本机密钥: {cfg['key']}\n"
+                                       f"让对方执行：lansync.exe pair --key {cfg['key']}\n"
+                                       f"或把本机密钥改成对方的（设置页）。")
                 if res["status"] != 200:
                     raise RuntimeError(f"HTTP {res['status']}")
                 ui(done)
@@ -1310,7 +1552,9 @@ def gui():
                 for p in paths_:
                     res = put_file(ip, port, cfg["key"], p, sender_name(), progress=on_progress)
                     if res["status"] == 401:
-                        raise RuntimeError("密钥不匹配（401），请先在两台机器上用同一密钥配对")
+                        raise RuntimeError(f"密钥不匹配（401），对方拒收。\n\n本机密钥: {cfg['key']}\n"
+                                           f"让对方执行：lansync.exe pair --key {cfg['key']}\n"
+                                           f"或把本机密钥改成对方的（设置页）。")
                     if res["status"] != 200:
                         raise RuntimeError(f"{p.name} 发送失败（HTTP {res['status']}）")
                     done_bytes["n"] += p.stat().st_size
@@ -1321,21 +1565,66 @@ def gui():
         threading.Thread(target=work, daemon=True).start()
 
     def do_discover():
-        tip.set("正在发现局域网设备…")
+        set_tip("正在发现：广播 + 已知设备 + 扫描本网段…")
 
         def work():
-            peers = discover(timeout=1.5)
-            ui(show_peers, peers)
+            peers = discover(timeout=1.5, deep=True)
+            history = load_peers()
+            ui(show_peers, peers, history)
 
-        def show_peers(peers):
-            if not peers:
-                tip.set("未发现设备（对端需先启动服务；也可直接填 IP）")
+        def show_peers(peers, history):
+            values = []
+            for p in peers:
+                v = f"{p['ip']}:{p['port']}"
+                if v not in values:
+                    values.append(v)
+            for h in history:
+                v = f"{h['ip']}:{h.get('port', DEFAULT_PORT)}"
+                if v not in values:
+                    values.append(v)   # 离线的历史目标也列出来，可直接重试
+            if values:
+                target_box.configure(values=values)
+                target_box.delete(0, "end")
+                target_box.insert(0, values[0])
+            if peers:
+                names = "、".join((p.get("device") or p["ip"]) for p in peers[:4])
+                more = "  …" if len(peers) > 4 else ""
+                set_tip(f"在线 {len(peers)} 台：{names}{more}")
+            elif values:
+                set_tip("广播没找到设备（跨网段或屏蔽广播）；已列出连过的目标，可直接发送", error=True)
+            else:
+                set_tip("未发现设备：对方需先启动服务，或直接在左侧填对方 IP", error=True)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_current():
+        tgt = parse_target()
+        if not tgt:
+            return
+        ip, port = tgt
+        set_tip(f"正在检查 {ip}:{port} …")
+
+        def work():
+            res = check_key(ip, port, cfg["key"])
+            ui(show_check, ip, port, res)
+
+        def show_check(ip, port, res):
+            if not res.get("reachable"):
+                report_error("连不上",
+                             f"{ip}:{port} 没有响应。\n\n"
+                             f"请确认：对端已启动服务、IP 正确、对端防火墙放行该端口。")
                 return
-            values = [f"{p['ip']}:{p['port']}" for p in peers]
-            target_box.configure(values=values)
-            target_box.delete(0, "end")
-            target_box.insert(0, values[0])
-            tip.set(f"发现 {len(peers)} 台设备，已填入第一台")
+            if res.get("auth"):
+                remember_peer(ip, port, res.get("device", ""), via="check")
+                set_tip(f"✓ {res.get('device') or ip} 在线，密钥匹配，可以发送")
+            elif res.get("auth") is False:
+                report_error("密钥不匹配",
+                             f"{res.get('device') or ip} 在线，但密钥对不上，发送会被拒收（401）。\n\n"
+                             f"本机密钥: {cfg['key']}\n\n"
+                             f"让对方执行：\n  lansync.exe pair --key {cfg['key']}\n"
+                             f"或把本机密钥改成对方的（设置页）。")
+            else:
+                set_tip(f"{res.get('device') or ip} 在线，但无法判定密钥（对端版本可能较旧）", error=True)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1431,7 +1720,30 @@ def gui():
     add_field(0, "接收端口", port_var, 10)
     add_field(1, "发现端口 (UDP)", dport_var, 10)
     add_field(2, "设备名", name_var, 24)
-    add_field(3, "配对密钥", key_var, 24)
+
+    def copy_key():
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(cfg["key"])
+            set_tip(f"已复制当前密钥：{cfg['key']}")
+        except Exception:
+            pass
+
+    ttk.Label(form, text="配对密钥").grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Entry(form, textvariable=key_var, width=24).grid(row=3, column=1, sticky="w")
+    kbtn = ttk.Frame(form)
+    kbtn.grid(row=3, column=2, sticky="w", padx=(8, 0))
+    ttk.Button(kbtn, text="随机生成", width=9,
+               command=lambda: (key_var.set(secrets.token_hex(4)),
+                                set_tip("已生成新密钥，点下面「应用密钥并重启服务」生效"))).pack(side="left")
+    ttk.Button(kbtn, text="复制", width=6, command=copy_key).pack(side="left", padx=(6, 0))
+
+    ttk.Label(set_tab, foreground="#777", justify="left",
+              text=("密钥说明：两台机器的密钥必须完全一致，否则对方发来的内容会被 401 拒收。\n"
+                    "  本机当前生效密钥：%s\n"
+                    "  对齐方法：①让对方执行 pair --key %s；②或把本机改成对方的密钥。\n"
+                    "  不确定时，在发送页填好 IP 点「检查密钥」，会直接告诉你是哪种情况。"
+                    % (cfg["key"], cfg["key"]))).pack(anchor="w", pady=(14, 0))
 
     brow = ttk.Frame(set_tab)
     brow.pack(fill="x", pady=(14, 0))
@@ -1571,7 +1883,18 @@ def gui():
         root.after(4000, tick_status)
 
     # ---------- 启动 ----------
+    def prefill_targets():
+        """把连过的设备填进下拉框：跨网段时广播找不到，靠这份历史最省事。"""
+        try:
+            vals = [f"{h['ip']}:{h.get('port', DEFAULT_PORT)}" for h in load_peers()]
+            if vals:
+                target_box.configure(values=vals)
+                target_box.insert(0, vals[0])
+        except Exception:
+            pass
+
     def boot():
+        prefill_targets()
         refresh_status()
         refresh_inbox()
         if selftest:
@@ -1583,6 +1906,12 @@ def gui():
                 ui(start_svc)
 
         threading.Thread(target=check, daemon=True).start()
+
+    want_tab = os.environ.get("LAN_SYNC_GUI_TAB", "").strip().lower()
+    if want_tab == "settings":
+        nb.select(set_tab)
+    elif want_tab == "inbox":
+        nb.select(inbox_tab)
 
     root.after(120, poll_queue)
     root.after(200, boot)
@@ -1618,7 +1947,12 @@ def build_parser():
 
     sp = sub.add_parser("discover", help="发现局域网内其他设备")
     sp.add_argument("--timeout", type=float, default=2.0)
+    sp.add_argument("--no-scan", action="store_true", help="只做广播和已知设备探测，不扫本网段")
     sp.set_defaults(func=cmd_discover)
+
+    sp = sub.add_parser("check", help="检查目标是否在线、密钥是否匹配")
+    sp.add_argument("--target", required=True, help="对方 IP[:端口]")
+    sp.set_defaults(func=cmd_check)
 
     sp = sub.add_parser("send", help="发送文本或文件")
     sp.add_argument("--target", default="auto", help="对方 IP[:端口]，或 auto 自动发现")
@@ -1635,6 +1969,11 @@ def build_parser():
     sp.set_defaults(func=cmd_pair)
 
     sub.add_parser("firewall", help="输出放行防火墙的命令").set_defaults(func=cmd_firewall)
+
+    sp = sub.add_parser("key", help="查看或生成配对密钥")
+    sp.add_argument("--new", action="store_true", help="随机生成一个新密钥并生效")
+    sp.add_argument("--copy", action="store_true", help="仅打印当前密钥，便于复制")
+    sp.set_defaults(func=cmd_key)
     return ap
 
 
