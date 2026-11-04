@@ -32,7 +32,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 SERVICE = "marvis-lan-sync"
 DEFAULT_PORT = 32100
 DEFAULT_DISCOVERY_PORT = 32101
@@ -577,13 +577,25 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"ok": False, "error": "not found"})
 
     # ---- POST: 文本 ----
+    def _record_inbound(self, kind, text, obj, name="", size=0):
+        """记录来消息的来源 IP/端口，之后「回复」就能原路返回。"""
+        raw_port = obj.get("from_port") or DEFAULT_PORT
+        try:
+            fport = int(raw_port)
+        except Exception:
+            fport = DEFAULT_PORT
+        append_message(kind=kind, text=text, sender=obj.get("from") or "unknown",
+                       name=name, size=size,
+                       from_ip=self.client_address[0], from_port=fport)
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         if not self._authed(query):
             self._json(401, {"ok": False, "error": "密钥不匹配"})
             return
-        if parsed.path != "/api/text":
+        if route not in ("/api/text", "/api/reply"):
             self._json(404, {"ok": False, "error": "not found"})
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -597,8 +609,30 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self._json(400, {"ok": False, "error": "空内容"})
             return
-        append_message(kind="text", text=text, sender=obj.get("from") or "unknown")
-        self._json(200, {"ok": True, "received": len(text)})
+
+        if route == "/api/text":
+            self._record_inbound("text", text, obj)
+            self._json(200, {"ok": True, "received": len(text)})
+            return
+
+        # /api/reply：把内容原路发回给来源设备，接收方不需要知道对方 IP
+        try:
+            target_ip, target_port = resolve_reply_target(obj.get("to") or "")
+        except Exception as e:
+            self._json(400, {"ok": False, "error": str(e)})
+            return
+        cfg = load_config()
+        try:
+            res = post_text(target_ip, target_port, cfg["key"], text,
+                            cfg.get("device_name", ""))
+        except Exception as e:
+            self._json(502, {"ok": False, "error": f"回传失败：{e}"})
+            return
+        ok = res.get("status") == 200
+        self._json(200 if ok else 502, {
+            "ok": ok, "sent_to": f"{target_ip}:{target_port}",
+            "peer_status": res.get("status"),
+        })
 
     # ---- PUT: 文件 ----
     def do_PUT(self):
@@ -624,7 +658,9 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 f.write(chunk)
                 received += len(chunk)
-        append_message(kind="file", text="", sender=sender, name=dest.name, size=received)
+        append_message(kind="file", text="", sender=sender, name=dest.name, size=received,
+                       from_ip=self.client_address[0],
+                       from_port=query.get("from_port", [DEFAULT_PORT])[0])
         self._json(200, {"ok": True, "saved": dest.name, "bytes": received})
 
     def do_HEAD(self):
@@ -633,12 +669,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def append_message(kind: str, text: str, sender: str, name: str = "", size: int = 0) -> None:
+def append_message(kind: str, text: str, sender: str, name: str = "", size: int = 0,
+                   from_ip: str = "", from_port: int = 0) -> None:
     p = paths()
     p["inbox_msgs"].parent.mkdir(parents=True, exist_ok=True)
-    rec = {"time": now_str(), "from": sender, "kind": kind, "text": text, "name": name, "size": size}
+    rec = {"time": now_str(), "from": sender, "kind": kind, "text": text,
+           "name": name, "size": size, "from_ip": from_ip, "from_port": from_port}
     with open(p["inbox_msgs"], "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def last_inbound():
+    """最近一条来自其他设备的消息（用于「原路返回」）。"""
+    for rec in reversed(read_messages()):
+        ip = rec.get("from_ip") or ""
+        if ip and not ip.startswith("127."):
+            return rec
+    return None
+
+
+def resolve_reply_target(to: str = ""):
+    """决定回复发给谁：显式指定 > 最近一条来消息的来源。"""
+    to = (to or "").strip()
+    if to:
+        if ":" in to:
+            host, _, port = to.rpartition(":")
+            return host, int(port)
+        for p in load_peers():
+            if p.get("device") == to or p.get("ip") == to:
+                return p["ip"], int(p.get("port") or DEFAULT_PORT)
+        return to, int(load_config().get("port", DEFAULT_PORT))
+    last = last_inbound()
+    if not last:
+        raise RuntimeError("还没有收到过其他设备的消息，无法原路返回")
+    return last["from_ip"], int(last.get("from_port") or DEFAULT_PORT)
 
 
 def read_messages():
@@ -666,7 +730,9 @@ def inbox_items(limit: int = 50):
             file_meta[rec.get("name", "")] = rec
         else:
             items.append({"type": "text", "time": rec.get("time", ""),
-                          "from": rec.get("from", ""), "text": rec.get("text", "")})
+                          "from": rec.get("from", ""), "text": rec.get("text", ""),
+                          "from_ip": rec.get("from_ip", ""),
+                          "from_port": rec.get("from_port", 0)})
     if p["inbox_files"].exists():
         for f in sorted(p["inbox_files"].iterdir()):
             if not f.is_file():
@@ -677,6 +743,8 @@ def inbox_items(limit: int = 50):
                 "time": meta.get("time") or datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                 "from": meta.get("from", ""), "name": f.name,
                 "size": f.stat().st_size, "path": str(f),
+                "from_ip": meta.get("from_ip", ""),
+                "from_port": meta.get("from_port", 0),
             })
     items.sort(key=lambda x: x.get("time", ""))
     return items[-limit:]
@@ -956,9 +1024,18 @@ def stop_service(quiet: bool = False):
 
 # ---------------------------------------------------------------- 发送
 
+def local_port() -> int:
+    try:
+        return int(load_config().get("port", DEFAULT_PORT))
+    except Exception:
+        return DEFAULT_PORT
+
+
 def post_text(ip: str, port: int, key: str, text: str, sender: str) -> dict:
     conn = http.client.HTTPConnection(ip, port, timeout=20)
-    body = json.dumps({"text": text, "from": sender}, ensure_ascii=False).encode("utf-8")
+    # 带上自己的监听端口，对方才能「原路返回」而不必知道我们的端口
+    body = json.dumps({"text": text, "from": sender, "from_port": local_port()},
+                      ensure_ascii=False).encode("utf-8")
     conn.request("POST", "/api/text", body=body, headers={
         "Content-Type": "application/json; charset=utf-8",
         "X-Sync-Key": key,
@@ -972,7 +1049,8 @@ def post_text(ip: str, port: int, key: str, text: str, sender: str) -> dict:
 
 def put_file(ip: str, port: int, key: str, path: Path, sender: str, progress=None) -> dict:
     size = path.stat().st_size
-    q = urllib.parse.urlencode({"name": path.name, "from": sender})
+    q = urllib.parse.urlencode({"name": path.name, "from": sender,
+                                "from_port": local_port()})
     conn = http.client.HTTPConnection(ip, port, timeout=300)
     conn.putrequest("PUT", f"/api/file?{q}")
     conn.putheader("X-Sync-Key", key)
@@ -1174,6 +1252,25 @@ def cmd_key(args):
     print(cfg["key"])
 
 
+def cmd_reply(args):
+    """原路回复最近一条来消息的设备，不需要知道对方 IP。"""
+    cfg = load_config()
+    text = (getattr(args, "text", "") or "").strip()
+    if not text:
+        die("请提供回复内容：reply --text \"...\"")
+    try:
+        ip, port = resolve_reply_target(getattr(args, "to", "") or "")
+    except Exception as e:
+        die(str(e))
+    res = post_text(ip, port, cfg["key"], text, cfg.get("device_name", ""))
+    if res["status"] == 401:
+        die(f"对方密钥不匹配（401）。\n  本机密钥: {cfg['key']}\n"
+            f"  让对方执行: pair --key {cfg['key']}")
+    if res["status"] != 200:
+        die(f"回复失败，HTTP {res['status']}")
+    print(f"已回复 {ip}:{port}（使用本机密钥 {cfg['key']}）")
+
+
 def cmd_inbox(args):
     items = inbox_items(limit=args.limit)
     if not items:
@@ -1235,6 +1332,12 @@ button{padding:8px 18px;border-radius:8px;border:1px solid #8886;background:#256
 </div>
 
 <div class="card">
+  <div style="margin-bottom:8px">回复发消息的设备（原路返回，不用填 IP）</div>
+  <textarea id="reply" placeholder="输入要回给对方的内容"></textarea>
+  <div style="margin-top:10px"><button id="btnReply">发送回复</button> <span class="hint" id="replymsg"></span></div>
+</div>
+
+<div class="card">
   <div style="margin-bottom:8px">收件箱 <button id="refresh" style="float:right;padding:2px 10px;font-size:13px">刷新</button></div>
   <div id="list"><div class="hint">加载中…</div></div>
 </div>
@@ -1283,6 +1386,18 @@ document.getElementById("send").onclick = async ()=>{
 document.getElementById("txt").addEventListener("keydown", e=>{
   if(e.ctrlKey && e.key==="Enter") document.getElementById("send").click();
 });
+document.getElementById("btnReply").onclick = async ()=>{
+  const t = document.getElementById("reply").value.trim();
+  const msg = document.getElementById("replymsg");
+  if(!t){ msg.textContent = "内容为空"; return; }
+  msg.textContent = "发送中…";
+  try{
+    const r = await fetch("/api/reply", {method:"POST", headers:{...H,"Content-Type":"application/json"}, body:JSON.stringify({text:t})});
+    const d = await r.json().catch(()=>({}));
+    if(r.ok){ msg.textContent = "已回复 " + (d.sent_to||""); document.getElementById("reply").value = ""; loadInbox(); }
+    else { msg.textContent = "失败：" + (d.error || ("HTTP " + r.status)); }
+  }catch(e){ msg.textContent = "失败：" + e; }
+};
 document.getElementById("refresh").onclick = loadInbox;
 fetch("/api/ping").then(r=>r.json()).then(d=>{document.getElementById("dev").textContent="设备："+d.device+" · lan-sync "+d.version;});
 loadInbox();
@@ -1314,7 +1429,7 @@ def gui():
         import queue
         import tkinter as tk
         import webbrowser
-        from tkinter import filedialog, messagebox, ttk
+        from tkinter import filedialog, messagebox, simpledialog, ttk
     except Exception as e:
         die(f"无法加载图形界面（需要 tkinter）：{e}")
 
@@ -1641,8 +1756,48 @@ def gui():
     ibar = ttk.Frame(inbox_tab)
     ibar.pack(fill="x", pady=(8, 0))
     ttk.Button(ibar, text="刷新", command=lambda: refresh_inbox()).pack(side="left")
-    ttk.Button(ibar, text="打开收件文件夹", command=lambda: _open_path(paths()["root"] / "inbox")).pack(side="left", padx=6)
-    ttk.Label(ibar, text="双击文件行可直接打开；双击文本行复制到剪贴板", foreground="#888").pack(side="left", padx=8)
+    ttk.Button(ibar, text="回复选中", command=lambda: reply_to()).pack(side="left", padx=(6, 0))
+    ttk.Button(ibar, text="回复最近来消息", command=lambda: reply_to(last_inbound())).pack(side="left", padx=6)
+    ttk.Button(ibar, text="打开收件文件夹", command=lambda: _open_path(paths()["root"] / "inbox")).pack(side="left")
+    ttk.Label(ibar, text="双击文件行打开；双击文本行复制", foreground="#888").pack(side="left", padx=8)
+
+    def reply_to(item=None):
+        """原路回复：目标地址取自收到消息时记下的来源，无需手填 IP。"""
+        if item is None:
+            sel = tree.selection()
+            item = tree_items.get(sel[0]) if sel else None
+        if not item:
+            report_error("无法回复", "请先在列表里选中一条收到的消息。")
+            return
+        ip = (item.get("from_ip") or "").strip()
+        try:
+            port = int(item.get("from_port") or DEFAULT_PORT)
+        except Exception:
+            port = DEFAULT_PORT
+        if not ip or ip.startswith("127."):
+            report_error("无法回复", "这条消息来自本机，没有可回复的对方地址。")
+            return
+        who = item.get("from") or ip
+        content = simpledialog.askstring("回复", f"回复给 {who}（{ip}:{port}）：",
+                                         parent=root)
+        if not content or not content.strip():
+            return
+        set_tip(f"正在回复 {who} …")
+
+        def work():
+            try:
+                res = post_text(ip, port, cfg["key"], content.strip(), cfg.get("device_name", ""))
+                if res["status"] == 401:
+                    raise RuntimeError(f"对方密钥不匹配（401）。\n本机密钥: {cfg['key']}\n"
+                                       f"让对方执行：lansync.exe pair --key {cfg['key']}")
+                if res["status"] != 200:
+                    raise RuntimeError(f"HTTP {res['status']}")
+                ui(lambda: set_tip(f"已回复 {who}（{ip}:{port}）"))
+            except Exception as e:
+                msg = str(e)
+                ui(lambda: report_error("回复失败", msg))
+
+        threading.Thread(target=work, daemon=True).start()
 
     tree_items = {}
     inbox_busy = {"on": False}
@@ -1669,11 +1824,14 @@ def gui():
         tree.delete(*tree.get_children())
         tree_items.clear()
         for it in items:
+            src = it.get("from", "") or ""
+            if it.get("from_ip"):
+                src = f"{src} {it['from_ip']}".strip()
             if it["type"] == "text":
                 text = (it.get("text") or "").replace("\n", " ")
-                vals = (it.get("time", ""), "文本", it.get("from", ""), text[:100], "")
+                vals = (it.get("time", ""), "文本", src, text[:100], "")
             else:
-                vals = (it.get("time", ""), "文件", it.get("from", ""),
+                vals = (it.get("time", ""), "文件", src,
                         it.get("name", ""), f"{it.get('size', 0) // 1024} KB")
             iid = tree.insert("", "end", values=vals)
             tree_items[iid] = it
@@ -1963,6 +2121,11 @@ def build_parser():
     sp = sub.add_parser("inbox", help="查看收件箱")
     sp.add_argument("--limit", type=int, default=30)
     sp.set_defaults(func=cmd_inbox)
+
+    sp = sub.add_parser("reply", help="回复最近来消息的设备（原路返回，只用自己的密钥）")
+    sp.add_argument("--text", required=True, help="回复内容")
+    sp.add_argument("--to", default="", help="指定发给谁（IP 或设备名），默认最近一条来消息的来源")
+    sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("pair", help="设置配对密钥")
     sp.add_argument("--key", required=False)
