@@ -32,11 +32,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 SERVICE = "marvis-lan-sync"
 DEFAULT_PORT = 32100
 DEFAULT_DISCOVERY_PORT = 32101
 CHUNK = 1 << 20  # 1 MiB
+CREATE_NO_WINDOW = 0x08000000  # 子进程不弹控制台窗口（窗口版 GUI 下必须）
+LOG_MAX_BYTES = 2 * 1024 * 1024
 
 
 # ---------------------------------------------------------------- 配置与路径
@@ -117,7 +119,15 @@ def now_str() -> str:
 
 # ---------------------------------------------------------------- 网络工具
 
-def local_ips():
+_LOCAL_IPS = {"at": 0.0, "ips": []}
+
+
+def local_ips(max_age: float = 60.0):
+    """本机局域网 IP。结果缓存一段时间：GUI 每几秒刷新一次状态，
+    而探测要建 socket + getaddrinfo，没必要每次都做。"""
+    now = time.time()
+    if _LOCAL_IPS["ips"] and now - _LOCAL_IPS["at"] < max_age:
+        return list(_LOCAL_IPS["ips"])
     ips = []
     for probe in ("8.8.8.8", "114.114.114.114"):
         try:
@@ -138,6 +148,9 @@ def local_ips():
                 ips.append(ip)
     except Exception:
         pass
+    if ips:
+        _LOCAL_IPS["at"] = now
+        _LOCAL_IPS["ips"] = list(ips)
     return ips
 
 
@@ -277,9 +290,23 @@ def unique_path(folder: Path, name: str) -> Path:
         i += 1
 
 
+class SyncServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """浏览器预连接/取消下载会不断触发 ConnectionReset，默认实现会把完整堆栈
+        写进日志，把真正的错误淹掉。这类断连属于正常现象，直接忽略。"""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"LanSync/{VERSION}"
     protocol_version = "HTTP/1.1"
+    timeout = 60  # 空闲连接不无限占线程
 
     # ---- 基础响应 ----
     def _json(self, code: int, obj: dict):
@@ -309,7 +336,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         line = f"{now_str()} {self.address_string()} {fmt % args}\n"
         try:
-            with open(paths()["log"], "a", encoding="utf-8") as f:
+            log = paths()["log"]
+            # 简单轮转：超限就改名，避免日志无限增长
+            if log.exists() and log.stat().st_size > LOG_MAX_BYTES:
+                backup = log.with_suffix(".1.log")
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                    log.replace(backup)
+                except Exception:
+                    pass
+            with open(log, "a", encoding="utf-8") as f:
                 f.write(line)
         except Exception:
             pass
@@ -560,7 +597,7 @@ def cmd_serve(args):
 
     for _ in range(20):
         try:
-            srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+            srv = SyncServer(("0.0.0.0", port), Handler)
             break
         except OSError:
             port += 1
@@ -618,7 +655,7 @@ def start_background():
     paths()["root"].mkdir(parents=True, exist_ok=True)
     creationflags = 0
     if os.name == "nt":
-        creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        creationflags = 0x00000008 | 0x00000200 | CREATE_NO_WINDOW  # DETACHED | 新进程组 | 不弹窗
     # PyInstaller onefile 子进程会继承 _PYI_APPLICATION_HOME_DIR / _PYI_PARENT_PROCESS_LEVEL
     # 转而复用父进程的解压目录，父进程退出时便删不掉自己的 _MEI 目录（警告 + 残留），
     # 还存在清理竞态。这两个变量一起摘掉，子进程才会当作全新启动、解压到独立目录。
@@ -647,12 +684,68 @@ def start_background():
             "log": str(log)}
 
 
-def is_running(pid: int) -> bool:
+def _win_handle_alive(pid: int):
+    """用 Win32 API 判断进程存活，避免启动 tasklist 子进程。
+
+    从窗口版 GUI 里 spawn 任何控制台程序都会闪一下黑窗，所以这条热路径
+    （状态栏每 4 秒查一次、启动时轮询 40 次）必须走零进程的实现。
+    返回 True/False；取不到结论时返回 None 以便回退。
+    """
     try:
-        if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return True if ctypes.get_last_error() == 5 else False  # 5=拒绝访问，说明进程在
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return None
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def _win_terminate(pid: int) -> bool:
+    try:
+        import ctypes
+        PROCESS_TERMINATE = 0x0001
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if not h:
+            return False
+        try:
+            return bool(k32.TerminateProcess(h, 1))
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def is_running(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if os.name == "nt":
+        alive = _win_handle_alive(pid)
+        if alive is not None:
+            return alive
+        try:
             out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
-                                 capture_output=True, text=True, timeout=10)
+                                 capture_output=True, text=True, timeout=10,
+                                 creationflags=CREATE_NO_WINDOW)
             return str(pid) in out.stdout
+        except Exception:
+            return False
+    try:
         os.kill(pid, 0)
         return True
     except Exception:
@@ -670,7 +763,9 @@ def stop_service(quiet: bool = False):
         return False
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=15)
+            if not _win_terminate(pid):
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                               timeout=15, creationflags=CREATE_NO_WINDOW)
         else:
             os.kill(pid, 15)
         if not quiet:
@@ -1021,12 +1116,14 @@ def gui():
     def refresh_status():
         def work():
             st, running = is_service_running()
-            ui(apply_status, st, running)
+            ips = local_ips()   # 探测放在后台线程，主线程只负责显示
+            ui(apply_status, st, running, ips)
         threading.Thread(target=work, daemon=True).start()
 
-    def apply_status(st, running):
+    def apply_status(st, running, ips=None):
         port = st.get("port") or cfg.get("port", DEFAULT_PORT)
-        ips = local_ips()
+        if ips is None:
+            ips = list(_LOCAL_IPS["ips"])
         info.set(f"本机 {', '.join(ips) if ips else '未获取到 IP'}  ·  端口 {port}  ·  密钥 {cfg.get('key')}")
         if running:
             svc.set(f"● 服务运行中  PID {st['pid']}")
@@ -1057,7 +1154,23 @@ def gui():
     # ---------- 状态栏 ----------
     bar = ttk.Frame(root, padding=(14, 0, 14, 8))
     bar.pack(fill="x")
-    ttk.Label(bar, textvariable=tip, foreground="#777").pack(anchor="w")
+    tip_label = ttk.Label(bar, textvariable=tip, foreground="#777")
+    tip_label.pack(anchor="w")
+
+    def set_tip(text, error=False):
+        tip.set(text)
+        try:
+            tip_label.configure(foreground="#c0392b" if error else "#777")
+        except Exception:
+            pass
+
+    def report_error(title, msg):
+        """失败要显眼：状态栏变红 + 弹窗，避免像之前那样被灰色小字淹没。"""
+        set_tip(f"{title}：{msg}", error=True)
+        try:
+            messagebox.showerror(title, msg)
+        except Exception:
+            pass
 
     # ---------- 发送页 ----------
     trow = ttk.Frame(send_tab)
@@ -1138,11 +1251,11 @@ def gui():
         def done():
             send_text_btn.configure(state="normal")
             text_box.delete("1.0", "end")
-            tip.set(f"文本已发送到 {ip}:{port}")
+            set_tip(f"文本已发送到 {ip}:{port}")
 
         def failed(msg):
             send_text_btn.configure(state="normal")
-            tip.set(f"发送失败：{msg}")
+            report_error("发送失败", msg)
 
         def work():
             try:
@@ -1185,12 +1298,12 @@ def gui():
             send_files_btn.configure(state="normal")
             send_text_btn.configure(state="normal")
             prog_var.set("完成")
-            tip.set(f"已发送 {len(paths_)} 个文件到 {ip}:{port}")
+            set_tip(f"已发送 {len(paths_)} 个文件到 {ip}:{port}")
 
         def failed(msg):
             send_files_btn.configure(state="normal")
             send_text_btn.configure(state="normal")
-            tip.set(f"发送失败：{msg}")
+            report_error("发送失败", msg)
 
         def work():
             try:
@@ -1243,9 +1356,27 @@ def gui():
     ttk.Label(ibar, text="双击文件行可直接打开；双击文本行复制到剪贴板", foreground="#888").pack(side="left", padx=8)
 
     tree_items = {}
+    inbox_busy = {"on": False}
 
     def refresh_inbox():
-        items = inbox_items(limit=100)
+        # 读 messages.jsonl + 遍历收件目录都在后台线程做，避免收件多了界面卡顿
+        if inbox_busy["on"]:
+            return
+        inbox_busy["on"] = True
+
+        def work():
+            try:
+                items = inbox_items(limit=100)
+            except Exception:
+                items = None
+            ui(render_inbox, items)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def render_inbox(items):
+        inbox_busy["on"] = False
+        if items is None:
+            return
         tree.delete(*tree.get_children())
         tree_items.clear()
         for it in items:
@@ -1257,8 +1388,8 @@ def gui():
                         it.get("name", ""), f"{it.get('size', 0) // 1024} KB")
             iid = tree.insert("", "end", values=vals)
             tree_items[iid] = it
-        if items:
-            tip.set(f"收件箱共 {len(items)} 条")
+        if not items:
+            set_tip("收件箱是空的")
 
     def open_row(_event=None):
         sel = tree.selection()
@@ -1365,9 +1496,9 @@ def gui():
 
         def after_start(res):
             if res.get("warning"):
-                tip.set("启动异常：" + str(res["warning"]))
+                set_tip("启动异常：" + str(res["warning"]), error=True)
             else:
-                tip.set(f"服务已启动（端口 {res.get('port')}）")
+                set_tip(f"服务已启动（端口 {res.get('port')}）")
             refresh_status()
 
         threading.Thread(target=work, daemon=True).start()
@@ -1423,7 +1554,7 @@ def gui():
             try:
                 subprocess.Popen(["cmd", "/c", "start", "", url],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 creationflags=0x00000008)  # DETACHED_PROCESS
+                                 creationflags=0x00000008 | CREATE_NO_WINDOW)  # 后台起，不弹黑窗
                 opened = True
             except Exception:
                 opened = False
@@ -1436,10 +1567,7 @@ def gui():
 
     def tick_status():
         # 定时刷新状态，避免服务已退出但界面仍显示“运行中”
-        def work():
-            st, running = is_service_running()
-            ui(apply_status, st, running)
-        threading.Thread(target=work, daemon=True).start()
+        refresh_status()
         root.after(4000, tick_status)
 
     # ---------- 启动 ----------

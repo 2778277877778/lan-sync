@@ -1,4 +1,16 @@
-﻿
+﻿---
+name: lan-sync
+description: >-
+  灞€鍩熺綉鍙屾満浜掍紶锛堟枃鏈?+ 鏂囦欢锛夛紝绾?Python 鏍囧噯搴撱€侀浂绗笁鏂逛緷璧栥€佷笉璧颁簯鏈嶅姟銆傚綋鐢ㄦ埛鎯虫妸鏂囦欢鎴栨枃瀛椾粠涓€鍙扮數鑴戝彂鍒板悓涓€璺敱鍣?WiFi 涓嬬殑鍙︿竴鍙扮數鑴戯紝鎻愬埌鈥滈殧绌烘姇閫?AirDrop/灞€鍩熺綉浼犳枃浠?涓ゅ彴鐢佃剳浜掍紶/涓嶆兂鐢ㄥ井淇?QQ 缃戠洏 U 鐩樷€濓紝鎴栭渶瑕佸惎鍔ㄦ帴鏀舵湇鍔°€佹煡鏀朵欢绠便€佸榻愰厤瀵瑰瘑閽ャ€佹帓鏌ヨ繛涓嶄笂銆?01 鏃朵娇鐢ㄣ€傚绔病瑁?Python 鏃剁敤 scripts/lansync.exe 鍗曟枃浠剁増銆?AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: a9006db8cca6c95ca9109d79a7236bf6_5ab76fb8d47411f1a0da525400393706
+    ReservedCode1: Syw7Snpq6svmewpEU5W5Az3D/IwfxdQmR8uQfNoGKqqPl/QwOULW36+2ng8hRiBLMAJ4L5cZIi1uGuuqicceTdiQlxNeu9kuALU59bvHm+Op5msgNdtxqx4sNSQCXZkSgGDSpQjZecpxAQIxDQxNNInEQ0a8BN1n1UzMDUB51VMew+WDa6I1HqoyxiI=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: a9006db8cca6c95ca9109d79a7236bf6_5ab76fb8d47411f1a0da525400393706
+    ReservedCode2: Syw7Snpq6svmewpEU5W5Az3D/IwfxdQmR8uQfNoGKqqPl/QwOULW36+2ng8hRiBLMAJ4L5cZIi1uGuuqicceTdiQlxNeu9kuALU59bvHm+Op5msgNdtxqx4sNSQCXZkSgGDSpQjZecpxAQIxDQxNNInEQ0a8BN1n1UzMDUB51VMew+WDa6I1HqoyxiI=
+---
+
 
 
 # lan-sync锛氬眬鍩熺綉鍙屾満浜掍紶
@@ -8,7 +20,8 @@
 
 鏃ュ父浣跨敤鐩存帴鍙屽嚮 `scripts\lan-sync-gui.exe`锛堟垨杩愯 `lansync.exe gui`锛夛紝鎵撳紑鍗宠嚜鍔ㄥ湪鍚庡彴鍚姩鎺ユ敹鏈嶅姟锛?
 - **鍙戦€侀〉**锛氱偣銆屽彂鐜拌澶囥€嶈嚜鍔ㄥ垪鍑哄眬鍩熺綉鍐呭凡寮€鏈嶅姟鐨勬満鍣紝閫変腑鍚庡彂鏂囨湰鎴栨枃浠讹紙鍙閫夛紝甯﹁繘搴︽潯锛?- **鏀朵欢绠遍〉**锛氳嚜鍔ㄥ埛鏂版敹鍒扮殑鍐呭锛屽弻鍑绘枃浠剁洿鎺ユ墦寮€锛屽弻鍑绘枃鏈鍒跺埌鍓创鏉?- **璁剧疆椤?*锛氭敼绔彛銆佽澶囧悕銆侀厤瀵瑰瘑閽ワ紱鏀瑰瘑閽ヤ細鑷姩閲嶅惎鏈嶅姟鐢熸晥
-- 椤堕儴銆屾墦寮€缃戦〉銆嶏細鍦ㄦ祻瑙堝櫒閲屾墦寮€鍚屼竴濂楁帴鏀?涓婁紶鐣岄潰锛堥€傚悎鎵嬫満浼犱笢瑗垮埌鐢佃剳锛?
+- 椤堕儴銆屾墦寮€缃戦〉銆嶏細鍦ㄦ祻瑙堝櫒閲屾墦寮€鍚屼竴濂楁帴鏀?涓婁紶鐣岄潰锛堥€傚悎鎵嬫満浼犱笢瑗垮埌鐢佃剳锛夛紱鏈嶅姟娌″湪璺戞椂浼氳嚜鍔ㄥ厛鎷夎捣
+- 鍙戦€佸け璐ヤ細**寮圭獥鎻愮ず**銆佺姸鎬佹爮鍙樼孩锛屼笉浼氬彧鐣欎竴琛岀伆瀛?
 鍏抽棴绐楀彛鍚庡悗鍙版湇鍔＄户缁繍琛岋紱瑕佸仠鏈嶅姟鐐归《閮ㄣ€屽仠姝㈡湇鍔°€嶃€?
 ## 閮ㄧ讲鍓嶆彁锛堥噸瑕侊級
 
