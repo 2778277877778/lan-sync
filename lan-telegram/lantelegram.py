@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""lan-telegram —— 局域网聊天（M1：本地存储 + 点对点协议）
+"""lan-telegram —— 局域网聊天（M2：TLS 1.3 加密 + 指纹固定）
 
 设计文档见 docs/lan-telegram-design.md。
 M1 范围：两个实例互发文本、历史可分页、重启不丢、已读回执、离线重试。
-加密（TLS 1.3 + 指纹固定）安排在 M2 接入，本版先跑通链路。
+M2 范围：自签证书 + 证书指纹人工核对固定；启用 TLS 后两端仅允许 TLS 1.3，
+指纹不符（未固定 / 换证书）在握手层直接拒连；明文 HTTP 下行为与 M1 完全一致。
 
 用法：
     python lantelegram.py info
     python lantelegram.py serve --background
     python lantelegram.py send --target 10.10.156.243 --text "在吗"
     python lantelegram.py history --with 10.10.156.243
-    python lantelegram.py contacts
+    python lantelegram.py cert                      # 本机证书指纹（给对方核对）
+    python lantelegram.py trust --target <IP:端口> --expect <指纹前缀>   # 固定对端
+    python lantelegram.py tls on                    # 两端配对完成后启用 TLS 1.3
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
 import secrets
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -52,6 +57,11 @@ def paths() -> dict:
         "db": h / "messages.db",
         "state": h / "state.json",
         "log": h / "server.log",
+        "certs": h / "certs",
+        "self_cert": h / "certs" / "cert.pem",
+        "self_key": h / "certs" / "key.pem",
+        "pins": h / "certs" / "pins",
+        "pins_meta": h / "certs" / "pins.json",
     }
 
 
@@ -63,6 +73,7 @@ def load_config() -> dict:
         "device_name": socket.gethostname(),
         "port": DEFAULT_PORT,
         "key": "",
+        "tls": False,
     }
     if p["config"].exists():
         try:
@@ -116,6 +127,150 @@ def die(msg: str, code: int = 1):
     sys.exit(code)
 
 
+# ---------------------------------------------------------------- TLS 证书与指纹
+
+# 自签证书：Ed25519 + BasicConstraints CA:TRUE（自锚信任根）+ EKU serverAuth/clientAuth，
+# CN 内嵌本机 device_id（lan-telegram/<device_id>）。对端验证走「指纹固定」，不走公网 CA。
+
+
+def cert_fingerprint(pem) -> str:
+    """证书 DER 的 SHA-256，小写 hex。"""
+    from cryptography import x509 as _x
+    from cryptography.hazmat.primitives.serialization import Encoding
+    if isinstance(pem, str):
+        pem = pem.encode("utf-8")
+    der = _x.load_pem_x509_certificate(pem).public_bytes(Encoding.DER)
+    return hashlib.sha256(der).hexdigest()
+
+
+def fp_groups(hex_fp: str, groups: int = 8) -> str:
+    """指纹转人工核对格式：8 组 4 位大写十六进制。"""
+    return "-".join(hex_fp[i:i + 4].upper() for i in range(0, groups * 4, 4))
+
+
+def normalize_expect(text: str) -> str:
+    return "".join(ch for ch in (text or "").lower() if ch in "0123456789abcdef")
+
+
+def cn_device_from_pem(pem) -> str:
+    from cryptography import x509 as _x
+    if isinstance(pem, str):
+        pem = pem.encode("utf-8")
+    cert = _x.load_pem_x509_certificate(pem)
+    for at in cert.subject.get_attributes_for_oid(_x.oid.NameOID.COMMON_NAME):
+        cn = str(at.value)
+        if cn.startswith(SERVICE + "/"):
+            return cn.split("/", 1)[1]
+    return ""
+
+
+def ensure_self_cert(cfg):
+    """生成或读取本机自签证书，返回 (指纹hex, PEM bytes)。"""
+    p = paths()
+    if p["self_cert"].exists() and p["self_key"].exists():
+        pem = p["self_cert"].read_bytes()
+        return cert_fingerprint(pem), pem
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    except ImportError:
+        raise RuntimeError("TLS 功能需要 cryptography 库：pip install cryptography")
+    key = Ed25519PrivateKey.generate()
+    subj = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, f"{SERVICE}/{cfg['device_id']}"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, SERVICE),
+    ])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(subj).issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                                         key_encipherment=False, data_encipherment=False,
+                                         key_agreement=False, key_cert_sign=True, crl_sign=True,
+                                         encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH,
+                                                  ExtendedKeyUsageOID.CLIENT_AUTH]),
+                           critical=False)
+            .sign(key, None))
+    p["certs"].mkdir(parents=True, exist_ok=True)
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    p["self_cert"].write_bytes(cert_pem)
+    p["self_key"].write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+    return cert_fingerprint(cert_pem), cert_pem
+
+
+def load_pins() -> dict:
+    p = paths()["pins_meta"]
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return {}
+    return {}
+
+
+def add_pin(fp: str, pem: bytes, source: str = "") -> None:
+    p = paths()
+    p["pins"].mkdir(parents=True, exist_ok=True)
+    (p["pins"] / f"{fp}.pem").write_bytes(pem)
+    meta = load_pins()
+    dev = cn_device_from_pem(pem)
+    meta[fp] = {"device": dev, "source": source, "added": now_ms()}
+    p["pins_meta"].write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+
+
+def remove_pin(prefix: str) -> bool:
+    prefix = normalize_expect(prefix)
+    meta = load_pins()
+    for fp in list(meta):
+        if fp.startswith(prefix):
+            meta.pop(fp, None)
+            (paths()["pins"] / f"{fp}.pem").unlink(missing_ok=True)
+            paths()["pins_meta"].write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                                            encoding="utf-8")
+            return True
+    return False
+
+
+def pinned_cadata() -> str:
+    out = []
+    pins = paths()["pins"]
+    if pins.exists():
+        for f in sorted(pins.glob("*.pem")):
+            out.append(f.read_text(encoding="utf-8", errors="ignore"))
+    return "".join(out)
+
+
+def build_tls_context(cfg, server: bool) -> ssl.SSLContext:
+    """仅 TLS 1.3；信任库=已固定对端证书；双向要求客户端证书。"""
+    ensure_self_cert(cfg)
+    cadata = pinned_cadata()
+    if not cadata:
+        raise RuntimeError("还没有固定任何对端证书：先用 trust 配对")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER if server else ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(str(paths()["self_cert"]), str(paths()["self_key"]))
+    ctx.load_verify_locations(cadata=cadata)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    if not server:
+        ctx.check_hostname = False   # 身份靠指纹固定，不靠主机名
+    return ctx
+
+
+def tls_client_ctx(cfg):
+    return build_tls_context(cfg, server=False) if cfg.get("tls") else None
+
+
 # ---------------------------------------------------------------- 存储
 
 SCHEMA = """
@@ -165,6 +320,8 @@ CREATE TABLE IF NOT EXISTS events(
 );
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
+
+OUTBOX_BACKOFF_MS = (2_000, 5_000, 15_000, 30_000, 60_000)
 
 
 class Store:
@@ -341,7 +498,8 @@ class Store:
             return [dict(r) for r in rows]
 
     def bump_outbox(self, mid, attempts):
-        delay = min(60_000, 2_000 * (2 ** min(attempts, 4)))
+        # 与设计文档一致：2s / 5s / 15s / 30s / 60s 封顶
+        delay = OUTBOX_BACKOFF_MS[min(attempts, len(OUTBOX_BACKOFF_MS)) - 1]
         with self.lock:
             self.conn.execute("UPDATE outbox SET attempts=?, next_try=? WHERE message_id=?",
                               (attempts, now_ms() + delay, mid))
@@ -362,9 +520,12 @@ class Store:
 # ---------------------------------------------------------------- 客户端
 
 
-def http_json(ip, port, method, path, key, payload=None, timeout=8):
+def http_json(ip, port, method, path, key, payload=None, timeout=8, tls_ctx=None):
     """发一个带密钥的 JSON 请求，返回 (status, obj)。失败抛异常。"""
-    conn = http.client.HTTPConnection(ip, int(port), timeout=timeout)
+    if tls_ctx is not None:
+        conn = http.client.HTTPSConnection(ip, int(port), timeout=timeout, context=tls_ctx)
+    else:
+        conn = http.client.HTTPConnection(ip, int(port), timeout=timeout)
     body = None
     headers = {"X-Sync-Key": key}
     if payload is not None:
@@ -383,9 +544,10 @@ def http_json(ip, port, method, path, key, payload=None, timeout=8):
         conn.close()
 
 
-def hello(ip, port, key, device_id, name, my_port=DEFAULT_PORT):
+def hello(ip, port, key, device_id, name, my_port=DEFAULT_PORT, tls_ctx=None):
     st, obj = http_json(ip, port, "POST", "/api/v2/hello", key,
-                        {"device_id": device_id, "name": name, "port": my_port})
+                        {"device_id": device_id, "name": name, "port": my_port},
+                        tls_ctx=tls_ctx)
     if st == 200 and obj.get("service") == SERVICE:
         return obj
     if st == 401:
@@ -393,14 +555,16 @@ def hello(ip, port, key, device_id, name, my_port=DEFAULT_PORT):
     return None
 
 
-def post_message(ip, port, key, env):
-    st, obj = http_json(ip, port, "POST", "/api/v2/messages", key, env, timeout=15)
+def post_message(ip, port, key, env, tls_ctx=None):
+    st, obj = http_json(ip, port, "POST", "/api/v2/messages", key, env, timeout=15,
+                        tls_ctx=tls_ctx)
     return st, obj
 
 
-def send_ack(ip, port, key, mid, state="read"):
+def send_ack(ip, port, key, mid, state="read", tls_ctx=None):
     try:
-        http_json(ip, port, "POST", "/api/v2/ack", key, {"message_id": mid, "state": state}, timeout=5)
+        http_json(ip, port, "POST", "/api/v2/ack", key, {"message_id": mid, "state": state},
+                  timeout=5, tls_ctx=tls_ctx)
     except Exception:
         pass
 
@@ -442,6 +606,26 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
+    # ---- TLS 对端证书绑定
+    def peer_cert_pem(self) -> bytes:
+        """TLS 连接下取握手时已按固定指纹验证过的对端证书；明文连接返回空。"""
+        try:
+            der = self.connection.getpeercert(True)
+        except Exception:
+            return b""
+        if not der:
+            return b""
+        from cryptography import x509 as _x
+        from cryptography.hazmat.primitives.serialization import Encoding
+        if isinstance(der, (bytes, bytearray)):
+            return _x.load_der_x509_certificate(der).public_bytes(Encoding.PEM)
+        return ssl.DER_cert_to_PEM_cert(der).encode("utf-8")
+
+    def cn_device(self) -> str:
+        """TLS 模式下取对端证书 CN 里内嵌的 device_id；明文返回空。"""
+        pem = self.peer_cert_pem()
+        return cn_device_from_pem(pem) if pem else ""
+
     # ---- GET
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -450,11 +634,31 @@ class Handler(BaseHTTPRequestHandler):
         cfg = self.server.cfg
 
         if route == "/api/v2/ping":
-            return self._json(200, {
+            out = {
                 "ok": True, "service": SERVICE, "version": VERSION,
                 "device": cfg.get("device_name"), "device_id": cfg.get("device_id"),
                 "auth_required": True,
-            })
+            }
+            if cfg.get("tls") and paths()["self_cert"].exists():
+                try:
+                    out["tls"] = True
+                    out["fingerprint"] = cert_fingerprint(
+                        paths()["self_cert"].read_bytes())
+                except Exception:
+                    pass
+            return self._json(200, out)
+
+        if route == "/api/v2/cert":
+            # 证书是公开信息，必须在密钥校验之前、且**明文阶段即可访问**：
+            # 配对顺序是「双方先 trust 固定指纹，再各自 tls on」，否则互相拿不到证书。
+            try:
+                fp, pem_bytes = ensure_self_cert(cfg)
+            except RuntimeError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "service": SERVICE,
+                                    "device_id": cfg.get("device_id"),
+                                    "fingerprint": fp,
+                                    "cert_pem": pem_bytes.decode("utf-8")})
 
         if not self._authed(query):
             return self._json(401, {"ok": False, "error": "密钥不匹配"})
@@ -502,6 +706,11 @@ class Handler(BaseHTTPRequestHandler):
             peer_id = (obj.get("device_id") or "").strip()
             if not peer_id:
                 return self._json(400, {"ok": False, "error": "缺少 device_id"})
+            # TLS 模式：声明的设备 ID 必须与已验证证书的 CN 一致（防伪造 from）
+            if self.server.tls:
+                bound = self.cn_device()
+                if bound and peer_id != bound:
+                    return self._json(403, {"ok": False, "error": "证书与声明设备不符"})
             store.upsert_device(peer_id, obj.get("name") or "", self.client_address[0],
                                 int(obj.get("port") or DEFAULT_PORT))
             return self._json(200, {
@@ -515,6 +724,12 @@ class Handler(BaseHTTPRequestHandler):
             sender = (obj.get("from") or "").strip()
             if not mid or not sender:
                 return self._json(400, {"ok": False, "error": "缺少 id / from"})
+            if self.server.tls:
+                bound = self.cn_device()
+                if not bound:
+                    return self._json(403, {"ok": False, "error": "TLS 模式缺少已验证对端证书"})
+                if sender != bound:
+                    return self._json(403, {"ok": False, "error": "证书与声明设备不符"})
             conv = f"dm:{sender}"
             obj["conv"] = conv
             store.upsert_device(sender, obj.get("from_name") or "", self.client_address[0],
@@ -541,6 +756,7 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    tls = False
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -563,7 +779,11 @@ def deliver_now(store, cfg, mid, ip, port):
         "from_port": cfg.get("port"), "ts": msg["ts"], "kind": msg["kind"],
         "body": json.loads(msg["body"] or "{}"), "reply_to": msg["reply_to"] or None,
     }
-    st, obj = post_message(ip, port, cfg["key"], env)
+    try:
+        st, obj = post_message(ip, port, cfg["key"], env,
+                               tls_ctx=tls_client_ctx(cfg))
+    except Exception:
+        return False
     if st == 200 and obj.get("ok"):
         store.set_state(mid, "delivered" if obj.get("delivered") else "sent")
         store.dequeue(mid)
@@ -610,6 +830,14 @@ def cmd_info(args):
     print(f"  设备 ID : {cfg['device_id']}")
     print(f"  端口    : {cfg['port']}")
     print(f"  密钥    : {cfg['key']}")
+    if cfg.get("tls") and paths()["self_cert"].exists():
+        try:
+            print(f"  传输    : TLS 1.3 · 指纹 {fp_groups(cert_fingerprint(paths()['self_cert'].read_bytes()))}"
+                  f" · 已固定对端 {len(load_pins())} 个")
+        except Exception:
+            print("  传输    : TLS 1.3（证书读取失败）")
+    else:
+        print("  传输    : 明文 HTTP（tls on 可切换）")
     print(f"  服务    : {'运行中 PID ' + str(st.get('pid')) if running else '未运行'}")
     print(f"  会话数  : {len(convs)}")
     print(f"  数据目录: {paths()['root']}")
@@ -627,6 +855,15 @@ def cmd_serve(args):
         die(f"服务已在运行（PID {prev['pid']}，端口 {prev.get('port')}）")
 
     store = Store(paths()["db"])
+
+    tls = bool(cfg.get("tls"))
+    tls_ctx = None
+    if tls:
+        try:
+            tls_ctx = build_tls_context(cfg, server=True)
+        except RuntimeError as e:
+            die(f"启用 TLS 失败：{e}")
+
     for _ in range(20):
         try:
             srv = Server(("0.0.0.0", port), Handler)
@@ -636,9 +873,16 @@ def cmd_serve(args):
     else:
         die("找不到可用端口")
 
+    if tls_ctx is not None:
+        try:
+            srv.socket = tls_ctx.wrap_socket(srv.socket, server_side=True)
+        except Exception as e:
+            die(f"TLS 包裹监听套接字失败：{e}")
+
     srv.sync_key = cfg["key"]
     srv.store = store
     srv.cfg = cfg
+    srv.tls = tls
     if port != cfg.get("port"):
         cfg["port"] = port
         save_config(cfg)
@@ -649,6 +893,9 @@ def cmd_serve(args):
 
     print(f"[lan-telegram] 已启动  {cfg['device_name']}  (设备 {cfg['device_id'][:8]})")
     print(f"  端口: {port}   密钥: {cfg['key']}")
+    if tls:
+        fp, _ = ensure_self_cert(cfg)
+        print(f"  TLS:  1.3 强制 · 本机指纹 {fp_groups(fp)} · 已固定对端 {len(load_pins())} 个")
     print(f"  数据库: {paths()['db']}")
     sys.stdout.flush()
     try:
@@ -758,6 +1005,7 @@ def parse_target(text):
 
 def cmd_send(args):
     cfg = load_config()
+    tctx = tls_client_ctx(cfg)
     text = (args.text or "").strip()
     if not text:
         die("请提供 --text")
@@ -765,9 +1013,14 @@ def cmd_send(args):
     store = Store(paths()["db"])
     try:
         info = hello(ip, port, cfg["key"], cfg["device_id"], cfg.get("device_name"),
-                     cfg.get("port", DEFAULT_PORT))
+                     cfg.get("port", DEFAULT_PORT), tls_ctx=tctx)
     except RuntimeError as e:
         die(f"{e}\n  本机密钥: {cfg['key']}\n  让对方执行: pair --key {cfg['key']}")
+    except ssl.SSLError as e:
+        if "certificate verify failed" in str(e):
+            die(f"对端证书与已固定指纹不符（TLS 握手拒绝）。\n"
+                f"  若对方确已更换证书：trust --remove <旧指纹前缀> 后重新 trust 配对")
+        die(f"TLS 握手失败：{e}")
     except Exception as e:
         # 连不上：如果之前聊过，就按已知设备入队，等对方上线自动补发
         known = store.find_device(ip)
@@ -797,7 +1050,10 @@ def cmd_send(args):
     store.add_message(env, direction="out", state="queued")
     try:
         st, obj = post_message(ip, port, cfg["key"], {**env, "from_name": cfg.get("device_name"),
-                                                     "from_port": cfg.get("port")})
+                                                     "from_port": cfg.get("port")}, tls_ctx=tctx)
+    except ssl.SSLError as e:
+        store.enqueue(env["id"])
+        die(f"TLS 握手失败：{e}\n  若对方更换过证书，请重新 trust 配对")
     except Exception as e:
         store.enqueue(env["id"])
         print(f"对方暂不可达（{e}），消息已入队，等对方上线自动补发")
@@ -809,6 +1065,9 @@ def cmd_send(args):
     elif st == 401:
         store.enqueue(env["id"])
         die(f"密钥不匹配（401）。\n  本机密钥: {cfg['key']}")
+    elif st == 403:
+        store.enqueue(env["id"])
+        die(f"证书与声明设备不符（403）：{obj.get('error', '')}")
     else:
         store.enqueue(env["id"])
         print(f"发送失败（HTTP {st}），已入队重试")
@@ -857,10 +1116,12 @@ def cmd_history(args):
         print(f"[{fmt_ts(m['ts'])}] {who}: {text}" + (f"   ({state})" if m["direction"] == "out" else ""))
 
     # 看完即已读：本地标记 + 回执给对端
+    tctx = tls_client_ctx(cfg)
     for m in store.unread_inbound(conv):
         peer = store.get_device(m["sender"])
         if peer and peer.get("ip"):
-            send_ack(peer["ip"], int(peer.get("port") or DEFAULT_PORT), cfg["key"], m["id"], "read")
+            send_ack(peer["ip"], int(peer.get("port") or DEFAULT_PORT), cfg["key"], m["id"], "read",
+                     tls_ctx=tctx)
     store.mark_read(conv)
 
 
@@ -919,7 +1180,126 @@ def cmd_status(args):
         "port": st.get("port") or cfg.get("port"),
         "device": cfg.get("device_name"),
         "device_id": cfg.get("device_id"),
+        "tls": bool(cfg.get("tls")),
+        "pinned_peers": len(load_pins()),
     }, ensure_ascii=False, indent=2))
+
+
+def cmd_cert(args):
+    cfg = load_config()
+    try:
+        fp, _ = ensure_self_cert(cfg)
+    except RuntimeError as e:
+        die(str(e))
+    print("=== 本机 TLS 证书 ===")
+    print(f"  指纹（给对方核对）: {fp_groups(fp)}")
+    print(f"  完整指纹          : {fp}")
+    print(f"  证书 CN           : {SERVICE}/{cfg['device_id']}")
+    print(f"  证书文件          : {paths()['self_cert']}")
+    print(f"  当前传输          : {'TLS 1.3' if cfg.get('tls') else '明文 HTTP'}")
+    print(f"  已固定对端        : {len(load_pins())} 个")
+    print("\n对方核对上面指纹后执行：")
+    ip_hint = ""
+    try:
+        ip_hint = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        pass
+    print(f"  trust --target {ip_hint or '<本机IP>'}:{cfg.get('port')} "
+          f"--expect {fp_groups(fp)}")
+
+
+def cmd_trust(args):
+    cfg = load_config()
+    if args.list_pins:
+        pins = load_pins()
+        if not pins:
+            print("还没有固定任何对端证书。")
+            return
+        print("=== 已固定的对端 ===")
+        for fp, meta in sorted(pins.items(), key=lambda kv: kv[1].get("added", 0)):
+            print(f"  {fp_groups(fp)}  设备 {(meta.get('device') or '?')[:8]}"
+                  f"  来源 {meta.get('source') or '-'}  固定于 {fmt_ts(meta.get('added', 0))}")
+        return
+    if args.remove:
+        if remove_pin(args.remove):
+            print(f"已移除固定：{args.remove}")
+        else:
+            die(f"没有找到指纹以 {args.remove} 开头的固定记录")
+        return
+    if not args.expect:
+        die("trust 必须带 --expect <对方告知的指纹>：人工核对是防中间人的唯一环节")
+    want = normalize_expect(args.expect)
+    if len(want) < 16:
+        die("--expect 至少给出指纹前 4 组（16 个十六进制字符）")
+
+    if args.target:
+        ip, port = parse_target(args.target)
+        try:
+            st, obj = http_json(ip, port, "GET", "/api/v2/cert", cfg["key"],
+                                tls_ctx=tls_client_ctx(cfg))
+        except Exception as e:
+            die(f"拉取对端证书失败：{e}\n  请确认对方已 serve；若对方 TLS 已开而本机未开，"
+                f"改用 trust --pem <对方证书文件>")
+        if st != 200 or not obj.get("cert_pem"):
+            die(f"对端 /api/v2/cert 返回异常（HTTP {st}）")
+        pem = obj["cert_pem"].encode("utf-8")
+        source = args.target
+    elif args.pem:
+        try:
+            pem = Path(args.pem).read_bytes()
+        except Exception as e:
+            die(f"读取证书文件失败：{e}")
+        source = args.pem
+    else:
+        die("trust 需要 --target <IP[:端口]> 或 --pem <证书文件> 之一")
+
+    try:
+        fp = cert_fingerprint(pem)
+    except Exception:
+        die("不是有效的 PEM 证书")
+    if not fp.startswith(want):
+        die(f"指纹核对不符，已拒绝固定（存在中间人或拿错证书的风险）：\n"
+            f"  实际: {fp_groups(fp)}\n  期望: {args.expect}")
+    add_pin(fp, pem, source=source)
+    dev = cn_device_from_pem(pem)
+    print(f"已固定对端证书 {fp_groups(fp)}（设备 {dev[:8] or '?'}）。")
+    print("双方都固定后各自执行 tls on，通信即切换到 TLS 1.3。")
+
+
+def cmd_tls(args):
+    cfg = load_config()
+    mode = (args.mode or "status").strip().lower()
+    if mode == "status":
+        pinned = len(load_pins())
+        state = "TLS 1.3" if cfg.get("tls") else "明文 HTTP"
+        print(f"当前传输: {state}   已固定对端: {pinned} 个")
+        if cfg.get("tls") and not pinned:
+            print("[警告] TLS 已开但没有任何固定证书，serve 会拒绝启动。")
+        return
+    if mode == "on":
+        try:
+            ensure_self_cert(cfg)
+        except RuntimeError as e:
+            die(str(e))
+        if not pinned_cadata():
+            die("启用 TLS 前至少要固定一个对端证书：\n"
+                "  trust --target <对方IP:端口> --expect <对方 cert 显示的指纹>")
+        cfg["tls"] = True
+        save_config(cfg)
+        print("TLS 1.3 已启用。")
+    else:
+        cfg["tls"] = False
+        save_config(cfg)
+        print("TLS 已关闭，回到明文 HTTP（与 M1 行为一致）。")
+    st = read_state()
+    if st.get("pid") and is_running(st["pid"]):
+        stop_service(quiet=True)
+        time.sleep(0.5)
+        r = start_background()
+        print(f"服务已重启（PID {r.get('pid')}，端口 {r.get('port')}，"
+              f"模式 {'TLS 1.3' if cfg.get('tls') else '明文'}）")
+    else:
+        print("下次 serve 时生效。")
 
 
 # ---------------------------------------------------------------- CLI
@@ -958,6 +1338,20 @@ def build_parser():
     sp = sub.add_parser("pair", help="设置密钥")
     sp.add_argument("--key")
     sp.set_defaults(func=cmd_pair)
+
+    sub.add_parser("cert", help="查看/生成本机 TLS 证书与指纹").set_defaults(func=cmd_cert)
+
+    sp = sub.add_parser("trust", help="人工核对并固定对端证书指纹")
+    sp.add_argument("--target", default="", help="对方 IP[:端口]，从其 /api/v2/cert 拉证书")
+    sp.add_argument("--pem", default="", help="离线导入对方证书 PEM 文件")
+    sp.add_argument("--expect", default="", help="对方口头告知的指纹（至少前 4 组）")
+    sp.add_argument("--list", action="store_true", dest="list_pins", help="列出已固定对端")
+    sp.add_argument("--remove", default="", help="按指纹前缀移除固定")
+    sp.set_defaults(func=cmd_trust)
+
+    sp = sub.add_parser("tls", help="启用/关闭 TLS 1.3（缺省查看状态）")
+    sp.add_argument("mode", nargs="?", default="status", choices=["on", "off", "status"])
+    sp.set_defaults(func=cmd_tls)
 
     return ap
 
