@@ -122,3 +122,9 @@ docs/      完整使用说明（usage.md）与界面截图
 ```
 
 完整使用说明（含排障对照表）见 [docs/usage.md](docs/usage.md)。
+
+## 相关项目
+
+- **[lan-telegram](https://github.com/2778277877778/lan-telegram)**：局域网聊天应用（会话/已读回执/离线补发 + TLS 1.3 指纹固定）。
+  传输骨架源自本项目，自 v0.1.0 起拆分为独立仓库、独立发版；端口（32200）与数据目录（`.lan-telegram`）与本工具完全隔离，可同时运行。
+  拆分前的开发历史保留在本仓库 `feature/lan-telegram` 分支与 PR #2。
